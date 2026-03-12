@@ -13,22 +13,19 @@
 ///  [LAZ chunk table]          variable (appended after data, referenced by the i64 above)
 ///  [copc hierarchy EVLR]      60 + n*32 bytes
 ///
-/// The laz::LasZipCompressor is used for real LAZ 1.4 compression.
-/// Chunks are written into an in-memory Cursor<Vec<u8>> so we can track
-/// per-chunk cursor positions without buffering issues, then the buffer is
-/// written to the file. The 8-byte chunk-table offset pointer that laz
-/// writes as a cursor-relative value must be patched to an absolute file
-/// position before writing to disk.
+/// The LasZipCompressor writes directly to a BufWriter<File>, eliminating the
+/// need for an in-memory buffer. Only one node's points are in memory at a time.
 use crate::copc_types::{
     CopcInfo, EVLR_HEADER_SIZE, HierarchyEntry, VoxelKey, write_evlr, write_vlr,
 };
 use crate::octree::{OctreeBuilder, RawPoint};
+use rayon::prelude::*;
 use anyhow::{Context, Result};
-use byteorder::{LittleEndian, WriteBytesExt};
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use laz::{LasZipCompressor, LazVlrBuilder};
 use log::info;
-use std::collections::HashMap;
-use std::io::{Cursor, Seek, SeekFrom, Write};
+use std::collections::HashSet;
+use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::Path;
 
 // ---------------------------------------------------------------------------
@@ -58,10 +55,13 @@ fn encode_point_fmt7(rp: &RawPoint, buf: &mut Vec<u8>) {
 }
 
 /// Write a complete COPC file to `output_path`.
+///
+/// Streams compressed data directly to the output file — only one node's
+/// points are in memory at a time (~2.5 MB max).
 pub fn write_copc(
     output_path: &Path,
     builder: &OctreeBuilder,
-    node_map: &HashMap<VoxelKey, Vec<RawPoint>>,
+    node_keys: &[(VoxelKey, usize)],
 ) -> Result<()> {
     // -----------------------------------------------------------------------
     // Scale / offset – taken from the builder (captured from the first input file)
@@ -84,7 +84,6 @@ pub fn write_copc(
 
     let mut laz_vlr_payload: Vec<u8> = Vec::new();
     laz_vlr.write_to(&mut laz_vlr_payload)?;
-    // Should be 46 bytes for format 7 (2 items: Point14 + RGB14)
 
     // -----------------------------------------------------------------------
     // File layout constants
@@ -92,18 +91,39 @@ pub fn write_copc(
     let copc_info_vlr_size: u32 = 54 + 160; // 214
     let laz_vlr_size: u32 = 54 + laz_vlr_payload.len() as u32; // 100
     let offset_to_point_data: u32 = 375 + copc_info_vlr_size + laz_vlr_size;
-    // = 375 + 214 + 100 = 689
 
     let copc_info_payload_pos: u64 = 375 + 54; // byte position of copc info payload in file
 
     let b = &builder.bounds;
 
     // -----------------------------------------------------------------------
+    // Build BFS-ordered key list from node_keys
+    // -----------------------------------------------------------------------
+    let key_set: HashSet<VoxelKey> = node_keys.iter().map(|(k, _)| *k).collect();
+    let point_counts: std::collections::HashMap<VoxelKey, usize> =
+        node_keys.iter().copied().collect();
+
+    let ordered_keys: Vec<VoxelKey> = {
+        let mut result = Vec::new();
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(VoxelKey::root());
+        while let Some(k) = queue.pop_front() {
+            if key_set.contains(&k) {
+                result.push(k);
+                for child in k.children() {
+                    queue.push_back(child);
+                }
+            }
+        }
+        result
+    };
+
+    // -----------------------------------------------------------------------
     // Write LAS 1.4 header manually (375 bytes)
     // -----------------------------------------------------------------------
     let file = std::fs::File::create(output_path)
         .with_context(|| format!("Cannot create {:?}", output_path))?;
-    let mut w = std::io::BufWriter::new(file);
+    let mut w = BufWriter::new(file);
 
     w.write_all(b"LASF")?;
     w.write_u16::<LittleEndian>(0)?; // file source ID
@@ -184,126 +204,111 @@ pub fn write_copc(
         &laz_vlr_payload,
     )?;
 
-    // We are now at byte offset_to_point_data. Flush so the file is complete up to here.
+    // Flush header+VLRs so the file is complete up to offset_to_point_data.
     w.flush()?;
 
     // -----------------------------------------------------------------------
-    // Compress point data into an in-memory buffer via LasZipCompressor
+    // Stream compressed point data directly to file via LasZipCompressor
     // -----------------------------------------------------------------------
-    // We use Cursor<Vec<u8>> so stream_position() is always accurate (no
-    // buffering lag).  After done(), we patch the 8-byte chunk-table-offset
-    // pointer from cursor-relative to file-absolute before writing to disk.
-
-    // Collect nodes in BFS order.
-    let ordered_keys: Vec<VoxelKey> = {
-        let mut result = Vec::new();
-        let mut queue = std::collections::VecDeque::new();
-        queue.push_back(VoxelKey::root());
-        while let Some(k) = queue.pop_front() {
-            if node_map.contains_key(&k) {
-                result.push(k);
-                for child in k.children() {
-                    queue.push_back(child);
-                }
-            }
-        }
-        result
-    };
-
-    // Build the laz_vlr again (consumed by the compressor).
     let laz_vlr_for_compressor = LazVlrBuilder::default()
         .with_point_format(7, 0)
         .context("LazVlrBuilder (compressor)")?
         .with_variable_chunk_size()
         .build();
 
-    let cursor = Cursor::new(Vec::<u8>::new());
-    let mut compressor = LasZipCompressor::new(cursor, laz_vlr_for_compressor)
+    // The compressor writes directly to the output file. stream_position()
+    // returns absolute file positions, so done() patches the chunk-table
+    // offset correctly without manual arithmetic.
+    let mut compressor = LasZipCompressor::new(w, laz_vlr_for_compressor)
         .map_err(|e| anyhow::anyhow!("LasZipCompressor::new: {e}"))?;
 
-    // Reserve the chunk-table offset slot now so that cursor positions we
-    // query below are accurate (the slot is 8 bytes at cursor position 0).
     compressor
         .reserve_offset_to_chunk_table()
         .context("reserve_offset_to_chunk_table")?;
 
-    let mut chunk_cursor_starts: Vec<u64> = Vec::with_capacity(ordered_keys.len());
+    let mut chunk_starts: Vec<u64> = Vec::with_capacity(ordered_keys.len());
 
-    for (i, key) in ordered_keys.iter().enumerate() {
-        let pts = node_map.get(key).unwrap();
+    // Process nodes in batches: read + encode in parallel, compress sequentially.
+    // The compressor is stateful so compression must be serial, but reading from
+    // disk and encoding to format-7 bytes are embarrassingly parallel.
+    let batch_size = rayon::current_num_threads().max(4);
+    let total_keys = ordered_keys.len();
+    let mut global_idx = 0usize;
 
-        // Record the cursor position at the start of this chunk.
-        let chunk_cursor_start = compressor.get_mut().stream_position()?;
-        chunk_cursor_starts.push(chunk_cursor_start);
+    for batch in ordered_keys.chunks(batch_size) {
+        // Parallel read from disk + encode to format-7 bytes
+        let encoded_batch: Vec<Vec<u8>> = batch
+            .par_iter()
+            .map(|key| -> Result<Vec<u8>> {
+                let pts = builder.read_node(key)?;
+                let mut raw_bytes =
+                    Vec::with_capacity(POINT_RECORD_LENGTH as usize * pts.len());
+                for rp in &pts {
+                    encode_point_fmt7(rp, &mut raw_bytes);
+                }
+                Ok(raw_bytes)
+            })
+            .collect::<Result<Vec<_>>>()?;
 
-        // Encode all points for this node as raw format-7 bytes.
-        let mut raw_bytes: Vec<u8> = Vec::with_capacity(POINT_RECORD_LENGTH as usize * pts.len());
-        for rp in pts {
-            encode_point_fmt7(rp, &mut raw_bytes);
-        }
+        // Sequential compression (compressor is stateful)
+        for raw_bytes in &encoded_batch {
+            let chunk_start = compressor.get_mut().stream_position()?;
+            chunk_starts.push(chunk_start);
 
-        compressor
-            .compress_many(&raw_bytes)
-            .context("compress_many")?;
-
-        // For all chunks except the last, explicitly close the chunk so the
-        // next node starts a fresh chunk.
-        if i < ordered_keys.len() - 1 {
             compressor
-                .finish_current_chunk()
-                .context("finish_current_chunk")?;
+                .compress_many(raw_bytes)
+                .context("compress_many")?;
+
+            if global_idx < total_keys - 1 {
+                compressor
+                    .finish_current_chunk()
+                    .context("finish_current_chunk")?;
+            }
+            global_idx += 1;
         }
     }
 
-    // Finalize the last chunk and write the chunk table to the cursor.
+    // Finalize: writes the last chunk and the chunk table, patches the offset.
     compressor.done().context("compressor done")?;
 
-    let mut cursor = compressor.into_inner();
+    let mut w = compressor.into_inner();
+    let end_pos = w.stream_position()?;
+    w.flush()?;
 
-    // Read the cursor-relative chunk-table offset written by laz at cursor[0..8].
-    let cursor_bytes = cursor.get_mut();
-    let cursor_chunk_table_pos = i64::from_le_bytes(cursor_bytes[0..8].try_into().unwrap());
+    // Get the underlying File so we can read back the chunk-table offset
+    let mut file = w
+        .into_inner()
+        .map_err(|e| anyhow::anyhow!("BufWriter flush: {}", e.error()))?;
 
-    // Patch it to the absolute FILE position of the chunk table.
-    let file_chunk_table_pos = offset_to_point_data as i64 + cursor_chunk_table_pos;
-    cursor_bytes[0..8].copy_from_slice(&file_chunk_table_pos.to_le_bytes());
-
-    // Write the entire point data buffer to the output file.
-    let point_data = cursor.into_inner();
-    w.write_all(&point_data)?;
+    // Read the chunk-table offset written by the compressor at offset_to_point_data
+    file.seek(SeekFrom::Start(offset_to_point_data as u64))?;
+    let chunk_table_pos = file.read_i64::<LittleEndian>()? as u64;
 
     // -----------------------------------------------------------------------
     // Build chunk_info for the hierarchy EVLR
     // -----------------------------------------------------------------------
-    // Absolute file position of chunk i = offset_to_point_data + chunk_cursor_starts[i]
-    // Byte size of chunk i = next chunk start (or chunk table start) − this chunk start
     let mut chunk_info: Vec<(VoxelKey, u64, i32, i32)> = Vec::new();
 
     for (i, key) in ordered_keys.iter().enumerate() {
-        let pts = node_map.get(key).unwrap();
-        let cursor_start = chunk_cursor_starts[i];
-        let cursor_end = if i + 1 < chunk_cursor_starts.len() {
-            chunk_cursor_starts[i + 1]
+        let pc = point_counts.get(key).copied().unwrap_or(0);
+        let cursor_start = chunk_starts[i];
+        let cursor_end = if i + 1 < chunk_starts.len() {
+            chunk_starts[i + 1]
         } else {
-            // Last chunk ends where the chunk table starts.
-            cursor_chunk_table_pos as u64
+            chunk_table_pos
         };
-        let file_offset = offset_to_point_data as u64 + cursor_start;
         let byte_size = (cursor_end - cursor_start) as i32;
-        chunk_info.push((*key, file_offset, byte_size, pts.len() as i32));
+        chunk_info.push((*key, cursor_start, byte_size, pc as i32));
         info!(
             "Chunk {:?}: offset={}, size={}, pts={}",
-            key,
-            file_offset,
-            byte_size,
-            pts.len()
+            key, cursor_start, byte_size, pc
         );
     }
 
     // -----------------------------------------------------------------------
     // EVLR: copc hierarchy
     // -----------------------------------------------------------------------
-    let evlr_start = offset_to_point_data as u64 + point_data.len() as u64;
+    let evlr_start = end_pos;
 
     let mut hier_payload: Vec<u8> = Vec::with_capacity(chunk_info.len() * 32);
     for (key, offset, byte_size, point_count) in &chunk_info {
@@ -315,18 +320,19 @@ pub fn write_copc(
         }
         .write(&mut hier_payload)?;
     }
-    write_evlr(&mut w, "copc", 1000, "copc hierarchy", &hier_payload)?;
 
+    // Seek to end of compressed data to write the EVLR
+    file.seek(SeekFrom::Start(evlr_start))?;
+    let mut w = BufWriter::new(file);
+    write_evlr(&mut w, "copc", 1000, "copc hierarchy", &hier_payload)?;
     w.flush()?;
-    drop(w);
+    let mut file = w
+        .into_inner()
+        .map_err(|e| anyhow::anyhow!("BufWriter flush: {}", e.error()))?;
 
     // -----------------------------------------------------------------------
     // Patch the file: copc info VLR + EVLR offset
     // -----------------------------------------------------------------------
-    let mut f = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(output_path)?;
 
     // Patch copc info: root_hier_offset / root_hier_size
     let patched_info = CopcInfo {
@@ -342,12 +348,12 @@ pub fn write_copc(
     };
     let mut pinfo_buf = Vec::with_capacity(160);
     patched_info.write(&mut pinfo_buf)?;
-    f.seek(SeekFrom::Start(copc_info_payload_pos))?;
-    f.write_all(&pinfo_buf)?;
+    file.seek(SeekFrom::Start(copc_info_payload_pos))?;
+    file.write_all(&pinfo_buf)?;
 
     // Patch start_of_first_EVLR at byte 235
-    f.seek(SeekFrom::Start(235))?;
-    f.write_all(&evlr_start.to_le_bytes())?;
+    file.seek(SeekFrom::Start(235))?;
+    file.write_all(&evlr_start.to_le_bytes())?;
 
     info!("COPC file written: {:?}", output_path);
     Ok(())

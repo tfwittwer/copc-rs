@@ -186,6 +186,7 @@ dependencies = [
  "las",
  "laz 0.9.3",
  "log",
+ "rayon",
  "tempfile",
 ]
 
