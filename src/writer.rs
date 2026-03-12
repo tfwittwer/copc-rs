@@ -121,7 +121,12 @@ pub fn write_copc(
     // -----------------------------------------------------------------------
     // Write LAS 1.4 header manually (375 bytes)
     // -----------------------------------------------------------------------
-    let file = std::fs::File::create(output_path)
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(output_path)
         .with_context(|| format!("Cannot create {:?}", output_path))?;
     let mut w = BufWriter::new(file);
 
