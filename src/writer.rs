@@ -13,17 +13,19 @@
 ///  [LAZ chunk table]          variable (appended after data, referenced by the i64 above)
 ///  [copc hierarchy EVLR]      60 + n*32 bytes
 ///
-/// The LasZipCompressor writes directly to a BufWriter<File>, eliminating the
-/// need for an in-memory buffer. Only one node's points are in memory at a time.
+/// Uses ParLasZipCompressor for parallel chunk compression via rayon.
+/// Nodes are read from temp files and encoded in parallel batches, then
+/// compressed in parallel via compress_chunks(). The chunk table is read
+/// back from the file to recover per-chunk byte sizes for the hierarchy.
 use crate::copc_types::{
     CopcInfo, EVLR_HEADER_SIZE, HierarchyEntry, VoxelKey, write_evlr, write_vlr,
 };
 use crate::octree::{OctreeBuilder, RawPoint};
-use rayon::prelude::*;
 use anyhow::{Context, Result};
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use laz::{LasZipCompressor, LazVlrBuilder};
+use byteorder::{LittleEndian, WriteBytesExt};
+use laz::{LazVlrBuilder, ParLasZipCompressor};
 use log::info;
+use rayon::prelude::*;
 use std::collections::HashSet;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -56,8 +58,9 @@ fn encode_point_fmt7(rp: &RawPoint, buf: &mut Vec<u8>) {
 
 /// Write a complete COPC file to `output_path`.
 ///
-/// Streams compressed data directly to the output file — only one node's
-/// points are in memory at a time (~2.5 MB max).
+/// Reads nodes from temp files and compresses them in parallel using
+/// ParLasZipCompressor::compress_chunks(). Encoding and compression
+/// happen across all available cores.
 pub fn write_copc(
     output_path: &Path,
     builder: &OctreeBuilder,
@@ -213,7 +216,7 @@ pub fn write_copc(
     w.flush()?;
 
     // -----------------------------------------------------------------------
-    // Stream compressed point data directly to file via LasZipCompressor
+    // Parallel compression via ParLasZipCompressor
     // -----------------------------------------------------------------------
     let laz_vlr_for_compressor = LazVlrBuilder::default()
         .with_point_format(7, 0)
@@ -221,24 +224,22 @@ pub fn write_copc(
         .with_variable_chunk_size()
         .build();
 
-    // The compressor writes directly to the output file. stream_position()
-    // returns absolute file positions, so done() patches the chunk-table
-    // offset correctly without manual arithmetic.
-    let mut compressor = LasZipCompressor::new(w, laz_vlr_for_compressor)
-        .map_err(|e| anyhow::anyhow!("LasZipCompressor::new: {e}"))?;
+    let mut compressor = ParLasZipCompressor::new(w, laz_vlr_for_compressor)
+        .map_err(|e| anyhow::anyhow!("ParLasZipCompressor::new: {e}"))?;
 
     compressor
         .reserve_offset_to_chunk_table()
         .context("reserve_offset_to_chunk_table")?;
 
-    let mut chunk_starts: Vec<u64> = Vec::with_capacity(ordered_keys.len());
-
-    // Process nodes in batches: read + encode in parallel, compress sequentially.
-    // The compressor is stateful so compression must be serial, but reading from
-    // disk and encoding to format-7 bytes are embarrassingly parallel.
-    let batch_size = rayon::current_num_threads().max(4);
-    let total_keys = ordered_keys.len();
-    let mut global_idx = 0usize;
+    // Process nodes in batches: read + encode in parallel, compress in parallel.
+    // Each batch encodes a group of nodes, then compress_chunks() compresses
+    // all chunks in the batch across all cores simultaneously.
+    let batch_size = (rayon::current_num_threads() * 4).max(16);
+    info!(
+        "Writing {} nodes in batches of {} (parallel compression)",
+        ordered_keys.len(),
+        batch_size
+    );
 
     for batch in ordered_keys.chunks(batch_size) {
         // Parallel read from disk + encode to format-7 bytes
@@ -255,59 +256,54 @@ pub fn write_copc(
             })
             .collect::<Result<Vec<_>>>()?;
 
-        // Sequential compression (compressor is stateful)
-        for raw_bytes in &encoded_batch {
-            let chunk_start = compressor.get_mut().stream_position()?;
-            chunk_starts.push(chunk_start);
-
-            compressor
-                .compress_many(raw_bytes)
-                .context("compress_many")?;
-
-            if global_idx < total_keys - 1 {
-                compressor
-                    .finish_current_chunk()
-                    .context("finish_current_chunk")?;
-            }
-            global_idx += 1;
-        }
+        // Parallel compression — each chunk compressed independently across cores
+        compressor
+            .compress_chunks(encoded_batch)
+            .context("compress_chunks")?;
     }
 
-    // Finalize: writes the last chunk and the chunk table, patches the offset.
+    // Finalize: writes the last chunk remnants (if any) and the chunk table.
     compressor.done().context("compressor done")?;
 
     let mut w = compressor.into_inner();
     let end_pos = w.stream_position()?;
     w.flush()?;
 
-    // Get the underlying File so we can read back the chunk-table offset
+    // Get the underlying File so we can read back the chunk table
     let mut file = w
         .into_inner()
         .map_err(|e| anyhow::anyhow!("BufWriter flush: {}", e.error()))?;
 
-    // Read the chunk-table offset written by the compressor at offset_to_point_data
+    // -----------------------------------------------------------------------
+    // Read the chunk table back from the file to get per-chunk byte sizes
+    // -----------------------------------------------------------------------
+    let read_vlr = LazVlrBuilder::default()
+        .with_point_format(7, 0)
+        .context("LazVlrBuilder (read)")?
+        .with_variable_chunk_size()
+        .build();
+
     file.seek(SeekFrom::Start(offset_to_point_data as u64))?;
-    let chunk_table_pos = file.read_i64::<LittleEndian>()? as u64;
+    let chunk_table = laz::laszip::ChunkTable::read_from(&mut file, &read_vlr)
+        .map_err(|e| anyhow::anyhow!("Failed to read chunk table: {e}"))?;
 
     // -----------------------------------------------------------------------
     // Build chunk_info for the hierarchy EVLR
     // -----------------------------------------------------------------------
+    // First chunk starts right after the 8-byte chunk-table-offset slot
+    let first_chunk_start = offset_to_point_data as u64 + 8;
+    let mut current_offset = first_chunk_start;
     let mut chunk_info: Vec<(VoxelKey, u64, i32, i32)> = Vec::new();
 
     for (i, key) in ordered_keys.iter().enumerate() {
         let pc = point_counts.get(key).copied().unwrap_or(0);
-        let cursor_start = chunk_starts[i];
-        let cursor_end = if i + 1 < chunk_starts.len() {
-            chunk_starts[i + 1]
-        } else {
-            chunk_table_pos
-        };
-        let byte_size = (cursor_end - cursor_start) as i32;
-        chunk_info.push((*key, cursor_start, byte_size, pc as i32));
+        let byte_size = chunk_table[i].byte_count;
+        chunk_info.push((*key, current_offset, byte_size as i32, pc as i32));
         info!(
             "Chunk {:?}: offset={}, size={}, pts={}",
-            key, cursor_start, byte_size, pc
+            key, current_offset, byte_size, pc
         );
+        current_offset += byte_size;
     }
 
     // -----------------------------------------------------------------------
